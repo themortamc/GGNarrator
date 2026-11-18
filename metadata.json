@@ -1,0 +1,8 @@
+{
+  "name": "Mortups Locución Comercial",
+  "description": "Estudio de locución comercial en español rioplatense neutro para el guion de Mortups, con síntesis de voz mediante Gemini 3.8 Flash TTS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
