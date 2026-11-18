@@ -7,13 +7,18 @@ import { StudioPlayer } from './components/StudioPlayer';
 import type { GeneratedTake } from './types/studio';
 import { createWavAudioAsset } from './utils/audioWaveform';
 import {
-  DEFAULT_MORTUPS_SCRIPT,
-  DEFAULT_VOICE_STYLE,
   analyzeScript,
   validateTtsRequest,
-  type ScriptBlock,
   type VoiceName,
 } from './utils/scriptAnalysis';
+import type { StudioDraft } from './utils/scriptLibrary';
+import {
+  deleteTakeFromStorage,
+  loadStudioDraft,
+  loadTakesFromStorage,
+  saveStudioDraft,
+  saveTakeToStorage,
+} from './utils/studioPersistence';
 
 interface TtsApiResponse {
   audioBase64?: string;
@@ -21,19 +26,25 @@ interface TtsApiResponse {
   durationSeconds?: number;
   sampleRate?: number;
   byteLength?: number;
+  preparedText?: string;
   error?: string;
 }
 
-export default function App() {
-  const [scriptText, setScriptText] = useState<string>(DEFAULT_MORTUPS_SCRIPT);
-  const [stylePrompt, setStylePrompt] = useState<string>(DEFAULT_VOICE_STYLE);
-  const [selectedVoice, setSelectedVoice] = useState<VoiceName>('Puck');
+function nowTimeLabel(): string {
+  return new Date().toLocaleTimeString('es-AR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
 
+export default function App() {
+  const [draft, setDraft] = useState<StudioDraft>(() => loadStudioDraft());
   const [takes, setTakes] = useState<GeneratedTake[]>([]);
   const [activeTakeId, setActiveTakeId] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [generatingLabel, setGeneratingLabel] = useState<string>(
-    'Generando locución completa'
+    'Generando audio...'
   );
   const [apiError, setApiError] = useState<string | null>(null);
   const [validationErrors, setValidationErrors] = useState<{
@@ -45,6 +56,27 @@ export default function App() {
   const objectUrlsRef = useRef<string[]>([]);
 
   useEffect(() => {
+    saveStudioDraft(draft);
+  }, [draft]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadTakesFromStorage().then((stored) => {
+      if (cancelled || stored.length === 0) {
+        return;
+      }
+      for (const take of stored) {
+        objectUrlsRef.current.push(take.audioUrl);
+      }
+      setTakes(stored);
+      setActiveTakeId((prev) => prev ?? stored[0].id);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const urls = objectUrlsRef.current;
     return () => {
       for (const url of urls) {
@@ -53,29 +85,24 @@ export default function App() {
     };
   }, []);
 
-  const analysis = useMemo(() => analyzeScript(scriptText), [scriptText]);
-
-  const isDefaultState =
-    scriptText === DEFAULT_MORTUPS_SCRIPT &&
-    stylePrompt === DEFAULT_VOICE_STYLE;
+  const analysis = useMemo(
+    () => analyzeScript(draft.scriptText),
+    [draft.scriptText]
+  );
 
   const activeTake = useMemo(
     () => takes.find((t) => t.id === activeTakeId) ?? takes[0] ?? null,
     [takes, activeTakeId]
   );
 
-  const handleResetDefault = () => {
-    setScriptText(DEFAULT_MORTUPS_SCRIPT);
-    setStylePrompt(DEFAULT_VOICE_STYLE);
-    setValidationErrors({});
-    setApiError(null);
-  };
+  const nextTakeNumber = () =>
+    takes.reduce((max, t) => Math.max(max, t.takeNumber), 0) + 1;
 
-  const synthesizeSpeech = async (textToRead: string, scopeLabel: string) => {
+  const handleGenerateAudio = async () => {
     const validation = validateTtsRequest({
-      text: textToRead,
-      style: stylePrompt,
-      voiceName: selectedVoice,
+      text: draft.scriptText,
+      style: draft.stylePrompt,
+      voiceName: draft.voiceName,
     });
 
     if (!validation.valid) {
@@ -86,7 +113,9 @@ export default function App() {
     setValidationErrors({});
     setApiError(null);
     setIsGenerating(true);
-    setGeneratingLabel(`Generando ${scopeLabel.toLowerCase()} (${selectedVoice})`);
+    setGeneratingLabel(
+      `Optimizando ritmo y generando audio (${draft.voiceName})...`
+    );
 
     try {
       const response = await fetch('/api/tts/generate', {
@@ -95,9 +124,10 @@ export default function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          text: textToRead,
-          style: stylePrompt,
-          voiceName: selectedVoice,
+          text: draft.scriptText,
+          style: draft.stylePrompt,
+          voiceName: draft.voiceName,
+          autoProsody: true,
         }),
       });
 
@@ -113,34 +143,32 @@ export default function App() {
         payload.audioBase64,
         payload.mimeType || 'audio/wav'
       );
-      objectUrlsRef.current.push(asset.url);
 
-      const now = new Date();
-      const timeLabel = now.toLocaleTimeString('es-AR', {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-      });
+      const takeNumber = nextTakeNumber();
+      const newTake: GeneratedTake = {
+        id: `${Date.now()}-${takeNumber}`,
+        scriptId: 'draft',
+        takeNumber,
+        scopeLabel: 'Locución',
+        blockIndex: null,
+        text: payload.preparedText || draft.scriptText,
+        style: draft.stylePrompt,
+        voiceName: draft.voiceName,
+        audioUrl: asset.url,
+        wavBytes: asset.wavBytes,
+        durationSeconds: payload.durationSeconds ?? 0,
+        sampleRate: payload.sampleRate ?? 24000,
+        byteLength: payload.byteLength ?? asset.byteLength,
+        waveformPeaks: asset.peaks,
+        createdAtLabel: nowTimeLabel(),
+        isApproved: false,
+        kind: 'full',
+      };
 
-      setTakes((prev) => {
-        const nextNumber = prev.length + 1;
-        const newTake: GeneratedTake = {
-          id: `${Date.now()}-${nextNumber}`,
-          takeNumber: nextNumber,
-          scopeLabel,
-          text: textToRead,
-          style: stylePrompt,
-          voiceName: selectedVoice,
-          audioUrl: asset.url,
-          durationSeconds: payload.durationSeconds ?? 0,
-          sampleRate: payload.sampleRate ?? 24000,
-          byteLength: payload.byteLength ?? asset.byteLength,
-          waveformPeaks: asset.peaks,
-          createdAtLabel: timeLabel,
-        };
-        setActiveTakeId(newTake.id);
-        return [newTake, ...prev];
-      });
+      objectUrlsRef.current.push(newTake.audioUrl);
+      setTakes((prev) => [newTake, ...prev]);
+      setActiveTakeId(newTake.id);
+      void saveTakeToStorage(newTake);
     } catch (error) {
       const message =
         error instanceof Error
@@ -152,73 +180,75 @@ export default function App() {
     }
   };
 
-  const handleGenerateFull = () => {
-    void synthesizeSpeech(scriptText, 'Spot completo');
-  };
-
-  const handleGenerateBlock = (block: ScriptBlock) => {
-    void synthesizeSpeech(block.text, block.label);
+  const handleDeleteTake = (takeId: string) => {
+    setTakes((prev) => {
+      const target = prev.find((t) => t.id === takeId);
+      if (target) {
+        URL.revokeObjectURL(target.audioUrl);
+      }
+      const next = prev.filter((t) => t.id !== takeId);
+      if (activeTakeId === takeId) {
+        setActiveTakeId(next[0]?.id ?? null);
+      }
+      return next;
+    });
+    void deleteTakeFromStorage(takeId);
   };
 
   return (
     <div id="top" className="min-h-screen bg-[#F7F7F5] text-[#141619]">
       <HeaderBar
         isGenerating={isGenerating}
-        onGenerateFull={handleGenerateFull}
+        onGenerateFull={() => void handleGenerateAudio()}
       />
 
-      <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:py-10">
-        <div className="max-w-3xl">
-          <p className="text-xs font-medium text-[#525866]">
-            Spot comercial Mortups · Español rioplatense neutro · Gemini 3.8
-            Flash TTS
-          </p>
-          <h1 className="mt-2 font-display text-3xl font-semibold tracking-tight text-[#141619] text-balance sm:text-4xl">
-            Locución comercial con pausas naturales y cierre firme
+      <main className="mx-auto max-w-5xl px-4 py-8 sm:px-6 lg:py-10">
+        <div className="max-w-2xl">
+          <h1 className="font-display text-3xl font-semibold tracking-tight text-[#141619] text-balance sm:text-4xl">
+            Locución natural en un clic
           </h1>
-          <p className="mt-3 text-[15px] leading-relaxed text-[#525866]">
-            Ajustá el guion, verificá los puntos suspensivos de respiración y
-            generá tomas en audio WAV listas para editar o publicar.
+          <p className="mt-2.5 text-[15px] leading-relaxed text-[#525866]">
+            Escribí o pegá tu texto normal. Las pausas y respiraciones se
+            agregan solas al generar el audio.
           </p>
         </div>
 
-        <div className="mt-8 grid grid-cols-1 gap-8 lg:grid-cols-12 lg:items-start">
+        <div className="mt-7 grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
           <div className="space-y-6 lg:col-span-7">
             <ScriptWorkspace
-              scriptText={scriptText}
+              scriptText={draft.scriptText}
               onChangeScript={(val) => {
-                setScriptText(val);
+                setDraft((prev) => ({ ...prev, scriptText: val }));
                 if (validationErrors.text) {
                   setValidationErrors((prev) => ({ ...prev, text: undefined }));
                 }
               }}
-              onResetDefault={handleResetDefault}
-              isDefaultScript={isDefaultState}
+              onClearScript={() => {
+                setDraft((prev) => ({ ...prev, scriptText: '' }));
+                setValidationErrors({});
+              }}
               analysis={analysis}
               validationError={validationErrors.text}
-              isGenerating={isGenerating}
-              onGenerateBlock={handleGenerateBlock}
             />
 
             <DirectionPanel
-              stylePrompt={stylePrompt}
+              stylePrompt={draft.stylePrompt}
               onChangeStylePrompt={(val) => {
-                setStylePrompt(val);
+                setDraft((prev) => ({ ...prev, stylePrompt: val }));
                 if (validationErrors.style) {
-                  setValidationErrors((prev) => ({
-                    ...prev,
-                    style: undefined,
-                  }));
+                  setValidationErrors((prev) => ({ ...prev, style: undefined }));
                 }
               }}
-              selectedVoice={selectedVoice}
-              onSelectVoice={setSelectedVoice}
+              selectedVoice={draft.voiceName}
+              onSelectVoice={(voice: VoiceName) =>
+                setDraft((prev) => ({ ...prev, voiceName: voice }))
+              }
               styleError={validationErrors.style}
             />
 
             <ClaudeConnectPanel
-              selectedVoice={selectedVoice}
-              scriptText={scriptText}
+              selectedVoice={draft.voiceName}
+              scriptText={draft.scriptText}
             />
           </div>
 
@@ -230,15 +260,16 @@ export default function App() {
               generatingLabel={generatingLabel}
               apiError={apiError}
               onSelectTake={(take) => setActiveTakeId(take.id)}
-              onGenerateFull={handleGenerateFull}
+              onDeleteTake={handleDeleteTake}
+              onGenerateFull={() => void handleGenerateAudio()}
             />
           </div>
         </div>
       </main>
 
       <footer className="mt-12 border-t border-[#E4E4E0] bg-[#F7F7F5]">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-4 py-6 text-xs text-[#525866] sm:px-6">
-          <span>Mortups Locución Comercial</span>
+        <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-4 px-4 py-6 text-xs text-[#525866] sm:px-6">
+          <span>Mortups Locución</span>
           <span>Audio generado por Gemini 3.8 Flash TTS</span>
         </div>
       </footer>

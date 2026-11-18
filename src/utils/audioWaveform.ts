@@ -57,6 +57,7 @@ export function createWavAudioAsset(
   mimeType = 'audio/wav'
 ): {
   url: string;
+  wavBytes: Uint8Array;
   byteLength: number;
   peaks: number[];
 } {
@@ -66,6 +67,7 @@ export function createWavAudioAsset(
   const peaks = extractWaveformPeaksFromWavBytes(bytes, 56);
   return {
     url,
+    wavBytes: bytes,
     byteLength: bytes.length,
     peaks,
   };

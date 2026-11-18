@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
+import { buildNaturalDeliveryStyle } from '../src/utils/prosodyAnalyzer.ts';
+import { prepareAutoProsodyText } from './prosodyService.ts';
 import {
   DEFAULT_MORTUPS_SCRIPT,
   DEFAULT_VOICE_STYLE,
@@ -13,6 +15,7 @@ export interface SynthesizeSpeechInput {
   text?: string;
   style?: string;
   voiceName?: string;
+  autoProsody?: boolean;
 }
 
 export interface SynthesizeSpeechResult {
@@ -24,6 +27,10 @@ export interface SynthesizeSpeechResult {
   durationSeconds: number;
   sampleRate: number;
   byteLength: number;
+  preparedText: string;
+  autoPausesCount: number;
+  autoBreathsCount: number;
+  usedAiProsody: boolean;
 }
 
 export class TtsServiceError extends Error {
@@ -169,6 +176,17 @@ export async function synthesizeWavSpeech(
     );
   }
 
+  const autoProsody = input.autoProsody !== false;
+  const prosody = autoProsody
+    ? await prepareAutoProsodyText({ text, style })
+    : {
+        preparedText: text.trim(),
+        autoPausesCount: 0,
+        autoBreathsCount: 0,
+        usedAi: false,
+      };
+  const deliveryStyle = buildNaturalDeliveryStyle(style, autoProsody);
+
   try {
     const response = await ai.models.generateContent({
       model: TTS_MODEL,
@@ -177,9 +195,9 @@ export async function synthesizeWavSpeech(
           role: 'user',
           parts: [
             {
-              text: text.trim(),
+              text: prosody.preparedText,
               speechMetadata: {
-                style: style.trim(),
+                style: deliveryStyle,
               },
             },
           ],
@@ -221,6 +239,10 @@ export async function synthesizeWavSpeech(
       durationSeconds: wavMeta.durationSeconds,
       sampleRate: wavMeta.sampleRate,
       byteLength: wavBuffer.length,
+      preparedText: prosody.preparedText,
+      autoPausesCount: prosody.autoPausesCount,
+      autoBreathsCount: prosody.autoBreathsCount,
+      usedAiProsody: prosody.usedAi,
     };
   } catch (error) {
     if (error instanceof TtsServiceError) {

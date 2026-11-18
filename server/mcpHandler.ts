@@ -39,6 +39,7 @@ export interface McpDependencies {
     text: string;
     style: string;
     voiceName: string;
+    autoProsody?: boolean;
   }) => Promise<McpGeneratedAudioOutput>;
 }
 
@@ -77,6 +78,11 @@ const MCP_TOOLS = [
           enum: VOICE_OPTIONS.map((v) => v.id),
           description:
             'Voz base de Gemini 3.8 Flash TTS (por defecto: Puck).',
+        },
+        autoProsody: {
+          type: 'boolean',
+          description:
+            'Si es true (por defecto), analiza texto normal e inserta pausas y respiraciones naturales automáticamente.',
         },
       },
       additionalProperties: false,
@@ -244,12 +250,15 @@ export async function handleMcpJsonRpc(
         typeof args.voiceName === 'string' && args.voiceName.trim().length > 0
           ? args.voiceName
           : 'Puck';
+      const autoProsody =
+        typeof args.autoProsody === 'boolean' ? args.autoProsody : true;
 
       try {
         const generated = await deps.generateAudio({
           text,
           style,
           voiceName,
+          autoProsody,
         });
 
         const summaryLines = [

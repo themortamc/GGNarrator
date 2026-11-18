@@ -61,6 +61,10 @@ async function startServer() {
         style: typeof req.body?.style === 'string' ? req.body.style : '',
         voiceName:
           typeof req.body?.voiceName === 'string' ? req.body.voiceName : 'Puck',
+        autoProsody:
+          typeof req.body?.autoProsody === 'boolean'
+            ? req.body.autoProsody
+            : true,
       });
 
       res.json({
@@ -71,6 +75,10 @@ async function startServer() {
         durationSeconds: result.durationSeconds,
         sampleRate: result.sampleRate,
         byteLength: result.byteLength,
+        preparedText: result.preparedText,
+        autoPausesCount: result.autoPausesCount,
+        autoBreathsCount: result.autoBreathsCount,
+        usedAiProsody: result.usedAiProsody,
       });
     } catch (error) {
       if (error instanceof TtsServiceError) {
@@ -101,6 +109,10 @@ async function startServer() {
           typeof req.body?.voiceName === 'string'
             ? req.body.voiceName
             : undefined,
+        autoProsody:
+          typeof req.body?.autoProsody === 'boolean'
+            ? req.body.autoProsody
+            : true,
       });
 
       res.setHeader('Content-Type', 'audio/wav');
@@ -212,8 +224,13 @@ async function startServer() {
     const sessionId = incomingSessionId || crypto.randomUUID();
 
     const rpcResponse = await handleMcpJsonRpc(req.body, {
-      generateAudio: async ({ text, style, voiceName }) => {
-        const result = await synthesizeWavSpeech({ text, style, voiceName });
+      generateAudio: async ({ text, style, voiceName, autoProsody }) => {
+        const result = await synthesizeWavSpeech({
+          text,
+          style,
+          voiceName,
+          autoProsody,
+        });
         const saved = saveGeneratedAudioFile({
           buffer: result.wavBuffer,
           mimeType: result.mimeType,

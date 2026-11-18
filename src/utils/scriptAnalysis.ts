@@ -122,7 +122,7 @@ const BLOCK_ROLE_LABELS = [
 const VALID_VOICE_SET = new Set<string>(VOICE_OPTIONS.map((v) => v.id));
 
 export function countWords(text: string): number {
-  const cleaned = text.trim();
+  const cleaned = text.replace(/<breath>/gi, ' ').trim();
   if (!cleaned) {
     return 0;
   }
@@ -135,11 +135,13 @@ export function estimateBlockDurationSeconds(text: string): number {
     return 0;
   }
   const ellipsisCount = (text.match(/\.\.\./g) ?? []).length;
-  const withoutEllipsis = text.replace(/\.\.\./g, ' ');
-  const sentenceBreaks = (withoutEllipsis.match(/[.!?]+/g) ?? []).length;
+  const breathCount = (text.match(/<breath>/gi) ?? []).length;
+  const withoutTags = text.replace(/<breath>/gi, ' ').replace(/\.\.\./g, ' ');
+  const sentenceBreaks = (withoutTags.match(/[.!?]+/g) ?? []).length;
   // ~150 WPM (2.5 words/sec) for agile commercial Spanish + deliberate breath pauses
   const baseSpeechSeconds = words / 2.5;
-  const pauseSeconds = ellipsisCount * 0.55 + sentenceBreaks * 0.3;
+  const pauseSeconds =
+    ellipsisCount * 0.55 + breathCount * 0.45 + sentenceBreaks * 0.3;
   return Math.max(1, Math.round(baseSpeechSeconds + pauseSeconds));
 }
 
@@ -179,7 +181,9 @@ export function analyzeScript(text: string): ScriptAnalysis {
   });
 
   const ellipsisCount = (normalized.match(/\.\.\./g) ?? []).length;
-  const withoutEllipsis = normalized.replace(/\.\.\./g, ' ');
+  const withoutEllipsis = normalized
+    .replace(/<breath>/gi, ' ')
+    .replace(/\.\.\./g, ' ');
   const sentenceBreakCount = (withoutEllipsis.match(/[.!?]+/g) ?? []).length;
   const questionCount = (normalized.match(/\?/g) ?? []).length;
   const wordCount = blocks.reduce((sum, b) => sum + b.wordCount, 0);
