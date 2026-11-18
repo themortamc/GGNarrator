@@ -1,16 +1,20 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
+import { checkBearerAuth, handleMcpJsonRpc } from './server/mcpHandler.ts';
 import {
-  parseWavMetadata,
-  validateTtsRequest,
-} from './src/utils/scriptAnalysis.ts';
+  TTS_MODEL,
+  TtsServiceError,
+  getGeminiClient,
+  getStoredAudioFile,
+  saveGeneratedAudioFile,
+  synthesizeWavSpeech,
+} from './server/ttsService.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const TTS_MODEL = 'gemini-3.8-flash-tts';
 
 function resolvePort(): number {
   const portFlagIndex = process.argv.indexOf('--port');
@@ -23,56 +27,21 @@ function resolvePort(): number {
   return Number(process.env.PORT ?? 3000);
 }
 
+function resolvePublicBaseUrl(req: express.Request): string {
+  const envUrl = process.env.APP_URL?.trim();
+  if (envUrl && envUrl !== 'MY_APP_URL') {
+    return envUrl.replace(/\/+$/, '');
+  }
+  const host = req.get('x-forwarded-host') || req.get('host') || `localhost:${PORT}`;
+  const proto = req.get('x-forwarded-proto') || req.protocol || 'http';
+  return `${proto}://${host}`;
+}
+
 const PORT = resolvePort();
-
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
-
-function mapGeminiError(error: unknown): { status: number; message: string } {
-  const raw = error instanceof Error ? error.message : String(error);
-  const statusMatch = raw.match(/\b(400|401|403|404|429|500|503)\b/);
-  const statusCode = statusMatch ? Number(statusMatch[1]) : 500;
-
-  if (raw.includes('PERMISSION_DENIED') || raw.includes('API_KEY_INVALID') || statusCode === 403) {
-    return {
-      status: 403,
-      message:
-        'La clave de Gemini API no es válida o no tiene permisos. Verificá GEMINI_API_KEY en Settings > Secrets.',
-    };
-  }
-  if (raw.includes('RESOURCE_EXHAUSTED') || statusCode === 429) {
-    return {
-      status: 429,
-      message:
-        'Se alcanzó el límite de solicitudes para Gemini TTS. Esperá unos segundos o revisá la cuota en Settings > Secrets.',
-    };
-  }
-  if (raw.includes('NOT_FOUND') || statusCode === 404) {
-    return {
-      status: 404,
-      message: `El modelo ${TTS_MODEL} no estuvo disponible para esta solicitud.`,
-    };
-  }
-  return {
-    status: statusCode >= 400 && statusCode < 600 ? statusCode : 500,
-    message: `No se pudo generar el audio en este momento: ${raw}`,
-  };
-}
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', true);
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/health', (_req, res) => {
@@ -80,92 +49,195 @@ async function startServer() {
       ok: true,
       model: TTS_MODEL,
       configured: Boolean(getGeminiClient()),
+      mcp: '/mcp',
+      mcpAuthRequired: Boolean(process.env.MCP_AUTH_TOKEN?.trim()),
     });
   });
 
   app.post('/api/tts/generate', async (req, res) => {
-    const text = typeof req.body?.text === 'string' ? req.body.text : '';
-    const style = typeof req.body?.style === 'string' ? req.body.style : '';
-    const voiceName =
-      typeof req.body?.voiceName === 'string' ? req.body.voiceName : 'Puck';
+    try {
+      const result = await synthesizeWavSpeech({
+        text: typeof req.body?.text === 'string' ? req.body.text : '',
+        style: typeof req.body?.style === 'string' ? req.body.style : '',
+        voiceName:
+          typeof req.body?.voiceName === 'string' ? req.body.voiceName : 'Puck',
+      });
 
-    const validation = validateTtsRequest({ text, style, voiceName });
-    if (!validation.valid) {
-      const firstError =
-        validation.errors.text ??
-        validation.errors.style ??
-        validation.errors.voiceName ??
-        'Datos de entrada inválidos.';
-      res.status(400).json({ error: firstError, errors: validation.errors });
-      return;
+      res.json({
+        audioBase64: result.audioBase64,
+        mimeType: result.mimeType,
+        model: result.model,
+        voiceName: result.voiceName,
+        durationSeconds: result.durationSeconds,
+        sampleRate: result.sampleRate,
+        byteLength: result.byteLength,
+      });
+    } catch (error) {
+      if (error instanceof TtsServiceError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      const message =
+        error instanceof Error ? error.message : 'Error interno del servidor.';
+      res.status(500).json({ error: message });
     }
+  });
 
-    const ai = getGeminiClient();
-    if (!ai) {
-      res.status(503).json({
-        error:
-          'GEMINI_API_KEY no está configurada en el servidor. Configurala en Settings > Secrets para generar la locución real.',
+  app.post('/api/tts/wav', async (req, res) => {
+    if (
+      !checkBearerAuth(req.get('authorization'), process.env.MCP_AUTH_TOKEN)
+    ) {
+      res.status(401).json({
+        error: 'Token Bearer inválido o ausente para /api/tts/wav.',
       });
       return;
     }
 
     try {
-      const response = await ai.models.generateContent({
-        model: TTS_MODEL,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: text.trim(),
-                speechMetadata: {
-                  style: style.trim(),
-                },
-              },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName,
-              },
-            },
-          },
-        },
+      const result = await synthesizeWavSpeech({
+        text: typeof req.body?.text === 'string' ? req.body.text : undefined,
+        style: typeof req.body?.style === 'string' ? req.body.style : undefined,
+        voiceName:
+          typeof req.body?.voiceName === 'string'
+            ? req.body.voiceName
+            : undefined,
       });
 
-      const parts = response.candidates?.[0]?.content?.parts ?? [];
-      const audioPart = parts.find((part) => Boolean(part.inlineData?.data));
-      const base64Audio = audioPart?.inlineData?.data;
-      const mimeType = audioPart?.inlineData?.mimeType || 'audio/wav';
+      res.setHeader('Content-Type', 'audio/wav');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="mortups-${result.voiceName.toLowerCase()}.wav"`
+      );
+      res.setHeader('X-Audio-Duration', result.durationSeconds.toFixed(2));
+      res.send(result.wavBuffer);
+    } catch (error) {
+      if (error instanceof TtsServiceError) {
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      const message =
+        error instanceof Error ? error.message : 'Error interno del servidor.';
+      res.status(500).json({ error: message });
+    }
+  });
 
-      if (!base64Audio) {
-        res.status(502).json({
-          error:
-            'El modelo no devolvió datos de audio en la respuesta. Intentá nuevamente.',
-        });
+  app.get('/api/tts/files/:fileName', (req, res) => {
+    const rawId = req.params.fileName.replace(/\.wav$/i, '');
+    const stored = getStoredAudioFile(rawId);
+    if (!stored) {
+      res.status(404).json({
+        error: 'Archivo WAV no encontrado o expirado.',
+      });
+      return;
+    }
+    res.setHeader('Content-Type', stored.mimeType || 'audio/wav');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="mortups-${stored.voiceName.toLowerCase()}.wav"`
+    );
+    res.setHeader('Cache-Control', 'private, max-age=1800');
+    res.send(stored.buffer);
+  });
+
+  app.options('/mcp', (_req, res) => {
+    res.setHeader('Allow', 'GET, POST, DELETE, OPTIONS');
+    res.status(204).end();
+  });
+
+  app.get('/mcp', (req, res) => {
+    const acceptHeader = req.get('accept') || '';
+    if (acceptHeader.includes('text/event-stream')) {
+      if (
+        !checkBearerAuth(req.get('authorization'), process.env.MCP_AUTH_TOKEN)
+      ) {
+        res.status(401).json({ error: 'Bearer token requerido o inválido.' });
         return;
       }
 
-      const wavBytes = Buffer.from(base64Audio, 'base64');
-      const wavMeta = parseWavMetadata(new Uint8Array(wavBytes));
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+      res.write(': mcp-sse-ready\n\n');
 
-      res.json({
-        audioBase64: base64Audio,
-        mimeType,
-        model: TTS_MODEL,
-        voiceName,
-        durationSeconds: wavMeta.durationSeconds,
-        sampleRate: wavMeta.sampleRate,
-        byteLength: wavBytes.length,
+      const keepAlive = setInterval(() => {
+        res.write(': keepalive\n\n');
+      }, 25000);
+
+      req.on('close', () => {
+        clearInterval(keepAlive);
       });
-    } catch (error) {
-      const mapped = mapGeminiError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      return;
     }
+
+    res.status(200).json({
+      status: 'ready',
+      name: 'mortups-locucion-tts',
+      protocol: 'MCP Streamable HTTP (2025-03-26)',
+      transport: {
+        rpc: 'POST /mcp (application/json, JSON-RPC 2.0)',
+        sse: 'GET /mcp (Accept: text/event-stream)',
+      },
+      tools: ['obtener_guion_mortups', 'generar_locucion'],
+      authRequired: Boolean(process.env.MCP_AUTH_TOKEN?.trim()),
+    });
+  });
+
+  app.delete('/mcp', (req, res) => {
+    if (
+      !checkBearerAuth(req.get('authorization'), process.env.MCP_AUTH_TOKEN)
+    ) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    res.status(200).json({ ok: true });
+  });
+
+  app.post('/mcp', async (req, res) => {
+    if (
+      !checkBearerAuth(req.get('authorization'), process.env.MCP_AUTH_TOKEN)
+    ) {
+      res.status(401).json({
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+          code: -32001,
+          message: 'Bearer token requerido o inválido.',
+        },
+      });
+      return;
+    }
+
+    const incomingSessionId = req.get('mcp-session-id');
+    const sessionId = incomingSessionId || crypto.randomUUID();
+
+    const rpcResponse = await handleMcpJsonRpc(req.body, {
+      generateAudio: async ({ text, style, voiceName }) => {
+        const result = await synthesizeWavSpeech({ text, style, voiceName });
+        const saved = saveGeneratedAudioFile({
+          buffer: result.wavBuffer,
+          mimeType: result.mimeType,
+          voiceName: result.voiceName,
+          durationSeconds: result.durationSeconds,
+        });
+        const baseUrl = resolvePublicBaseUrl(req);
+        return {
+          downloadUrl: `${baseUrl}/api/tts/files/${saved.id}.wav`,
+          voiceName: result.voiceName,
+          durationSeconds: result.durationSeconds,
+          sampleRate: result.sampleRate,
+          byteLength: result.byteLength,
+          model: result.model,
+        };
+      },
+    });
+
+    res.setHeader('Mcp-Session-Id', sessionId);
+    if (rpcResponse.status === 202 || rpcResponse.body === null) {
+      res.status(202).end();
+      return;
+    }
+    res.status(rpcResponse.status).json(rpcResponse.body);
   });
 
   const httpServer = http.createServer(app);

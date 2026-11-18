@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { ClaudeConnectPanel } from './components/ClaudeConnectPanel';
 import { DirectionPanel } from './components/DirectionPanel';
 import { HeaderBar } from './components/HeaderBar';
 import { ScriptWorkspace } from './components/ScriptWorkspace';
@@ -213,6 +214,11 @@ export default function App() {
               selectedVoice={selectedVoice}
               onSelectVoice={setSelectedVoice}
               styleError={validationErrors.style}
+            />
+
+            <ClaudeConnectPanel
+              selectedVoice={selectedVoice}
+              scriptText={scriptText}
             />
           </div>
 

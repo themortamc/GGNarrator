@@ -38,6 +38,12 @@ export function HeaderBar({ isGenerating, onGenerateFull }: HeaderBarProps) {
           >
             Tomas
           </a>
+          <a
+            href="#conectar"
+            className="py-1 transition-colors hover:text-[#141619] hover:underline underline-offset-4 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#D94E28] rounded"
+          >
+            Conectar
+          </a>
         </nav>
 
         <div className="flex items-center shrink-0">
